@@ -20,7 +20,7 @@ A NUC plugged into a TV and a camera. The camera sees the kids, the NUC detects 
 1. **Camera:** Luxonis OAK, run by the existing **`my_depthai` camera service** (DepthAI v3, see §2.1). It is already connected. We consume it as a black box over Redis and do not modify it for v1.
 2. **NUC:** Intel NUC, Ubuntu 24.04, HDMI to the TV.
 3. **Players:** 2 to 4 kids of mixed ages, so multi-person tracking with stable IDs is required from the start.
-4. **Controls v1:** keyboard on the NUC. The phone remote moves to a later milestone (the control WebSocket stays in the design so it is cheap to add).
+4. **Controls v1:** keyboard on the NUC. The phone remote is **decided: later** (after M4); the control WebSocket stays in the design so it is cheap to add.
 5. **Art:** I generate simple original placeholder costumes. You can swap in your own images later by replacing files in an effect folder.
 
 ### 2.1 What the camera service actually provides (read from `my_depthai`)
@@ -28,30 +28,71 @@ A NUC plugged into a TV and a camera. The camera sees the kids, the NUC detects 
 | Fact | Detail | Consequence for this project |
 |------|--------|------------------------------|
 | Transport | `camera_broker.py` encodes each frame as JPEG and `XADD`s it to the Redis stream `camera_frames` (`MAXLEN ~ 100`). | Our `FrameSource` is a Redis consumer. No DepthAI code in this repo. |
-| Message fields | `camera_id`, `timestamp` (ISO string), `camera_type`, `output_type`, `width`, `height`, `format=jpeg`, `data`, plus an `is_fallback` flag (exact encoding lives in `shared.core.camera_stream.encode_frame_message`). | We filter by `camera_id` + `output_type`, and treat `is_fallback=true` as "camera offline". |
+| Message fields (provisional, see §2.3) | `camera_id`, `timestamp` (ISO string), `camera_type`, `output_type`, `width`, `height`, `format=jpeg`, `data`, plus an `is_fallback` flag (exact encoding lives in `shared.core.camera_stream.encode_frame_message`, being decoupled). | We filter by `camera_id` + `output_type`, and treat `is_fallback=true` as "camera offline". |
 | Outputs | `preview` (NV12, default 300x300), `video` (BGR888p), `fullvideo` (NV12, 4K), `still` (trigger only; the broker skips it). Only `dai.node.Camera`: **no depth, no stereo, no on-device NN** today. | Pose runs on the NUC for v1. Depth and on-device pose become *camera service* features (M5), not assumptions. |
-| Rate | Broker loop is rate-limited to `--fps` (default 5; the shipped config uses 3 fps at 4K for inspection). One loop publishes every camera and output serially. | **Must be reconfigured for games**: 1280x720 `video` at 30 fps, `--fps 30`, `--max-stream-length 10`. Needs a benchmark (§7), not an assumption. |
+| Rate | Broker loop is rate-limited to `--fps` (default 5; the shipped config uses 3 fps at 4K for inspection). One loop publishes every camera and output serially. | **Must be reconfigured for games**: 1280x720 `video` at 30 fps, `--fps 30`, `--max-stream-length 10`. Needs a benchmark (§7), not an assumption; mind PoE bandwidth (§2.2 F1). |
 | Resilience | Health monitor, reconnect with backoff, Redis reconnect, fallback "CAMERA OFFLINE" frames, management UI on `127.0.0.1:5002`. | We do not re-implement reconnect. We only react to `is_fallback` and to a stalled stream. |
 | Timestamps | `timestamp` is stamped by the broker at publish time. Device capture time exists in per-frame metadata inside the library but is **not published**. | Latency measured from this field excludes camera exposure and USB time. Adding the device timestamp is a small camera-service change worth making (M1). |
-| Stack | `depthai>=3,<4`, Python, Redis. The camera config in the repo uses an IP address (`169.254.1.222`), so the device is probably a **PoE OAK**, not USB. | PoE bandwidth is shared; 720p30 should fit, which the benchmark confirms. |
+| Stack | `depthai>=3,<4`, Python, Redis. **Confirmed PoE** (gigabit Ethernet, ~940 Mbit/s usable; config uses an IP address). | The link, not the NUC, may be the first bottleneck. See §2.2 bandwidth math. |
 
 **Integration decision (D7): consume over Redis rather than import `CameraManager` directly.**
 Redis already isolates the camera's flaky USB/PoE and XLink behaviour in its own process (the benchmark notes show a second XLink connection in one process fails and DepthAI can segfault), so a camera crash cannot take down the game. Cost: one extra copy, one JPEG encode and one decode per frame, roughly 5 to 10 ms at 720p. Fallback if the benchmark says that cost is too high: a `DirectOakCamera` adapter that imports `CameraManager` in-process, behind the same `FrameSource` interface. Nothing else changes.
 
-**What we need from the camera service, in priority order**
-1. Config only (no code): a 720p/30 `video` output in `camera_manager_config.json` and the broker flags above.
-2. Small change: publish the device capture timestamp in the message (for honest latency).
-3. Later: an optional second stream `camera_depth` (aligned depth) and on-device pose, owned by `my_depthai`, consumed here through the same adapter pattern.
+**Change policy: `my_depthai` is frozen for now.** Nothing below is started. This document assumes these changes will be made once the go-ahead is given, and the design is written so nothing in this repo depends on them landing first.
+
+Requested camera-service changes (all **pending approval**, in priority order):
+1. Config only: a game profile with a 720p/30 output and broker flags `--fps 30 --max-stream-length 10`. See §2.2 for which output type to use over PoE.
+2. Small code change: read the newest queued frame instead of the oldest (see §2.2, finding F2).
+3. Small code change: publish the device capture timestamp in the message.
+4. Later: an optional second stream `camera_depth` (aligned depth) and on-device pose.
 
 **Redis consumption contract (our side)**
 - Reader uses `XREAD BLOCK` starting from `$` (new messages only) and **always keeps only the newest message in a batch**, discarding older ones. It never replays the backlog. This implements "always show the newest frame".
 - If no message arrives for 1.0 s, or `is_fallback` is set, the display shows the "reconnecting" screen. Recovery is automatic.
 - Redis binds to localhost only, no password needed for v1 (privacy rule D6).
 
+### 2.2 Suitability assessment of `my_depthai` for this application
+
+**Verdict: suitable as the camera layer, with three gaps to close before it can drive a 30 fps game. Not suitable as-is for the game's frame rate.** It was built for slow manufacturing inspection, and its strengths (robustness, isolation) matter more to us than its weaknesses, which are all configuration or small changes.
+
+**Strengths for us**
+- Self-healing: health monitor, reconnect with backoff, Redis reconnect, "CAMERA OFFLINE" fallback frames. A kids' appliance must recover without a keyboard.
+- Process isolation through Redis (the repo's own notes say a second XLink connection in one process fails and DepthAI can segfault).
+- Already has the right queue policy: non-blocking device queues of depth 4 that drop the oldest frame.
+- Full camera control (exposure, ISO, focus, regions) which we need to lock exposure indoors. Management UI is loopback-only and token-protected.
+- Broad test suite (21 test files, hardware-free mocks) and a benchmark script that runs each resolution in its own subprocess.
+- DepthAI v3, which supports depth and on-device NN for later.
+
+**Gaps and findings**
+
+| # | Finding | Impact | Fix (pending approval) |
+|---|---------|--------|------------------------|
+| F1 | **PoE bandwidth.** The `video` output is requested as BGR888p (3 bytes/px). 1280x720x3x30 = ~83 MB/s = **~664 Mbit/s**, about 70% of gigabit and risky next to other traffic. 1080p30 BGR (~1.5 Gbit/s) is impossible. The `preview` output is NV12 (1.5 bytes/px): 720p30 = ~332 Mbit/s. | Wrong output type or size would silently cap fps. | Use `preview` at 1280x720 NV12 (size is configurable), or add an NV12 `video` variant. Confirm with `benchmark.py`/`benchmark_nv12.py`. Keep the camera on a dedicated NIC/switch port. |
+| F2 | **Oldest-first read creates standing latency.** `run()` sleeps one frame interval and *then* does work, and only restarts the timer after the work (`last_frame_time` is set at the end). The effective rate is therefore below the camera fps, the depth-4 device queue fills, and `tryGet()` returns the *oldest* of 4 frames: up to ~4 frames (~130 ms at 30 fps) of added, constant delay. This alone would eat the whole latency budget. | Costumes would trail the kids by a visible margin. | Drain the queue and keep the newest frame (small change in `camera_manager`/`base_module`), and fix the timer to be start-to-start. |
+| F3 | **Single serial loop.** One thread polls, converts (NV12 to BGR), JPEG-encodes and `XADD`s every camera and output in turn. Fine for one camera at 30 fps (~5-10 ms of work per frame at 720p); a second camera or output would cut the rate. | Limits us to one camera, one output for v1. | Accept for v1. If needed, one publisher thread per camera/output. |
+| F4 | **Timestamp is publish time, not capture time.** Device metadata exists in memory but is not published. | We cannot measure or correct true latency. | Add the device capture timestamp to the message. |
+| F5 | **Two JPEG hops** (JPEG in the broker, JPEG again in our WebSocket) cost ~10 ms and some quality. | Small. | v1: decode, run pose, re-encode. If the benchmark says it matters, forward the broker JPEG bytes unchanged when no server-side drawing is needed (the browser draws the effects, so this is likely possible). |
+| F6 | **No depth, no NN, no pose** in the service (only `dai.node.Camera`). | Pose runs on the NUC. | Expected; later stream `camera_depth` / on-device pose (M5). |
+| F7 | **Inspection-oriented defaults** (4K at 3 fps in the shipped config, 3-5 fps broker default). | Wrong out of the box. | Dedicated game profile (config only). |
+| F8 | **Coupled to a monorepo `shared` package** (`ConfigLoader`, stream codec). | Not installable standalone today. | Being decoupled by you; see §2.3. |
+
+**Net latency budget implication:** with F2 fixed, the camera-side cost is about one frame interval (33 ms) plus transport. With F2 unfixed, add ~130 ms, so F2 is the single most important change.
+
+### 2.3 Placeholder: camera stream contract (shared library being decoupled)
+
+The `shared` library that defines the Redis message is being decoupled and its final shape is unknown. We assume it will exist as a small standalone package, and keep everything uncertain behind one seam so only one file changes when it lands.
+
+- **Seam:** `backend/kidsar/capture/camera_stream_codec.py` with a single function `decode(fields: Mapping[bytes, bytes]) -> CameraFrameMessage`. Nothing else in this repo reads raw Redis fields.
+- **`CameraFrameMessage` (our own dataclass, fixed):** `camera_id: str`, `output_type: str`, `width: int`, `height: int`, `jpeg: bytes`, `t_publish: datetime`, `t_capture: datetime | None` (None until F4 lands), `is_fallback: bool`.
+- **Provisional field mapping (TODO, replace when the decoupled library is defined):** `camera_id`, `timestamp` (ISO) to `t_publish`, `output_type`, `width`, `height`, `format` (must equal `jpeg`), `data` to `jpeg`, `is_fallback`. Field names come from the current README and are **unverified against the real encoder**.
+- **Stream and tuning names:** stream name `camera_frames`, camera id and output type are settings in our `config.py` (`CAMERA_STREAM`, `CAMERA_ID`, `CAMERA_OUTPUT`), not constants.
+- **When the library lands:** either import its decoder inside `camera_stream_codec.py`, or keep our own decoder and add a contract test that decodes a fixture message produced by the library's encoder. A recorded fixture message is committed now so the test exists from M0.
+- **Open placeholders:** package name and version pin, schema version field, any change of transport (stream vs pub/sub), and whether the device timestamp field has a name yet.
+
 ## 3. System overview
 
 ```
- Luxonis OAK camera (PoE/USB, DepthAI v3)
+ Luxonis OAK camera (PoE, DepthAI v3)
      │
      ▼
 ┌─────────────────────────── NUC (one machine) ───────────────────────────┐
@@ -239,16 +280,16 @@ Rules to keep this: capture at 720p, run the model on a smaller copy; always pro
 ## 12. Proposed milestones
 
 1. **M0, skeleton:** repo layout, protocol, `Synthetic` camera, display page drawing a fake skeleton with one hat. Runs anywhere, no Redis.
-2. **M1a, camera link + benchmark:** `RedisCamera` against the live broker, raw video on the TV via the display page, measured fps and latency. Decides D7 and the model budget.
+2. **M1a, camera link + benchmark:** (needs the approved camera-service changes of §2.1, or runs degraded without them) `RedisCamera` against the live broker, raw video on the TV via the display page, measured fps and latency. Decides D7 and the model budget.
 3. **M1b, pose + tracking:** pose model, tracker, hat follows a real kid on the TV.
-4. **M2, costume system:** manifest-driven attachments, control page, 4-5 costumes (cap, cape, mask, ...).
+4. **M2, costume system:** manifest-driven attachments, keyboard switching, 4-5 costumes (cap, cape, mask, ...). No control page yet.
 5. **M3, NUC appliance:** systemd units (§9), kiosk, boots straight into the game.
 6. **M4, games:** reactive effects, then segmentation-based games.
-7. **M5, camera-side upgrades (in `my_depthai`):** aligned depth stream, device timestamps, optional on-device pose.
+7. **M5, phone remote:** control page and `/ws/control` from a phone.
+8. **M6, camera-side upgrades (in `my_depthai`):** aligned depth stream, device timestamps, optional on-device pose.
 
 ## 13. Open questions (remaining)
 
-1. Which OAK model exactly (RVC2 vs RVC4) and is it PoE or USB? The repo hints at PoE (`169.254.1.222`). This sizes M5 on-device pose and depth.
-2. Where do `shared.core.camera_stream` (message encode/decode) and `ConfigLoader` live? `my_depthai` imports them from a monorepo `shared` package that is not in either repo I can see. I need its message schema, or I will decode the raw Redis fields directly and pin the field names in a test.
-3. Is it acceptable to add a small `game` config profile and the device-timestamp field to `my_depthai` (our branch there), or must it stay untouched?
-4. Phone remote: stay in M2 or move later (currently after keyboard-only v1)?
+1. Exact OAK model (RVC2 vs RVC4) and its PoE switch/NIC setup. This sizes M6 on-device pose and depth.
+2. Go-ahead for the camera-service changes in §2.1 / §2.2 (nothing is touched until then).
+3. The decoupled stream library: name, schema, device-timestamp field (placeholders in §2.3).
