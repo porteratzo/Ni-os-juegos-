@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<title>Niños Juegos</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; cursor: none; }
+  canvas { width: 100vw; height: 100vh; object-fit: contain; display: block; }
+  #status { position: fixed; inset: 0; display: none; align-items: center; justify-content: center;
+            flex-direction: column; color: #fff; font: 700 4vw system-ui, sans-serif; background: #12203a; }
+  #status small { font-weight: 400; font-size: 1.6vw; opacity: .7; margin-top: 1vw; }
+  #hud { position: fixed; top: 8px; left: 8px; color: #0f0; font: 14px monospace; display: none; white-space: pre; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1280" height="720"></canvas>
+<div id="status"><div>Buscando la cámara…</div><small>Un momento, ya casi</small></div>
+<div id="hud"></div>
+<script type="module" src="/static/display/main.js"></script>
+</body>
+</html>
