@@ -1,0 +1,14 @@
+{
+  "name": "Gorra roja",
+  "thumbnail": "thumb.png",
+  "attachments": [
+    {
+      "image": "cap.png",
+      "anchor": "head",
+      "width_per_head": 2.4,
+      "offset_x": 0.0,
+      "offset_y": -0.35,
+      "rotate_with": "shoulders"
+    }
+  ]
+}
